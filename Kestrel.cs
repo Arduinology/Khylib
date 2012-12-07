@@ -1,5 +1,7 @@
-﻿using System.Collections.Generic;
+﻿using System;
+using System.Collections.Generic;
 using System.Linq;
+using KSP.IO;
 using UnityEngine;
 
 namespace Khylib
@@ -8,19 +10,67 @@ namespace Khylib
     {
         public override void OnAwake()
         {
+            Immortal.AddImmortal<NetworkView>();
             Immortal.AddImmortal<Kestrel>();
         }
     }
 
+    [RequireComponent(typeof(NetworkView))]
     public class Kestrel : MonoBehaviour
     {
+        public const int NetworkVersion = 1;
+        public const int UtCompressRatio = 10000;
         private Window _kestrelWindow;
-        private KestrelNetworker _networker;
+        private Window _chatWindow;
         private const int Port = 25290;
         private bool _updateGui;
+        private int _lastUpdateSecond = DateTime.UtcNow.Second;
+        private int _lastTimewarpIndex = -1;
+
+        public void Start()
+        {
+            networkView.observed = this;
+            networkView.stateSynchronization = NetworkStateSynchronization.Off;
+        }
 
         public void Update()
         {
+            var runPerSecondUpdates = _lastUpdateSecond != DateTime.UtcNow.Second;
+            if (runPerSecondUpdates)
+                _lastUpdateSecond = DateTime.UtcNow.Second;
+            if (Network.isServer)
+            {
+                if (FlightGlobals.fetch != null && FlightGlobals.Vessels != null)
+                    foreach (var vessel in FlightGlobals.Vessels.Where(v => v.networkView == null))
+                        CreateVessel(vessel);
+                if (runPerSecondUpdates || TimeWarp.fetch != null && _lastTimewarpIndex != TimeWarp.CurrentRateIndex)
+                {
+                    var ut = Planetarium.GetUniversalTime();
+                    var longTime = (long)(ut * UtCompressRatio);
+                    networkView.RPC("SetGlobals", RPCMode.Others, (int)(longTime / uint.MaxValue), (int)longTime, TimeWarp.CurrentRateIndex);
+                    _lastTimewarpIndex = TimeWarp.CurrentRateIndex;
+                }
+            }
+            else if (Network.isClient && FlightGlobals.fetch != null)
+            {
+                var toKill = new List<Vessel>();
+                foreach (var vessel in FlightGlobals.Vessels.Where(v => v != FlightGlobals.ActiveVessel))
+                {
+                    if (vessel.networkView == null)
+                        toKill.Add(vessel);
+                    else if (vessel.networkView.isMine)
+                        vessel.networkView.RPC("GiveOwnership", RPCMode.Server);
+                }
+                foreach (var vessel in toKill)
+                    vessel.Die();
+                if (FlightGlobals.ActiveVessel != null)
+                {
+                    if (FlightGlobals.ActiveVessel.networkView == null)
+                        CreateVessel(FlightGlobals.ActiveVessel);
+                    else if (FlightGlobals.ActiveVessel.networkView.isMine == false)
+                        FlightGlobals.ActiveVessel.GetComponent<VesselNetworker>().GiveOwnership();
+                }
+            }
             if (_updateGui)
             {
                 RefreshWindow();
@@ -39,13 +89,16 @@ namespace Khylib
 
         private void RefreshWindow()
         {
+            if (_kestrelWindow == null)
+                _kestrelWindow = new Window("Kestrel") { WindowRect = new Rect(200, 200, 200, 200), Contents = new List<IWindowContent>() };
             _kestrelWindow.Contents.Clear();
             if (Network.isServer || Network.isClient)
             {
                 _kestrelWindow.Contents.Add(new Label(Network.isServer ? "Server" : "Client"));
-                _kestrelWindow.Contents.Add(new TextBox("", "", s => _networker.networkView.RPC("Alert", RPCMode.All, s)));
                 if (Network.isServer)
-                    _kestrelWindow.Contents.Add(new Scroller(Network.connections.Select(n => (IWindowContent)new Label(n.guid + " " + n.ipAddress)).ToArray()));
+                    _kestrelWindow.Contents.Add(new Scroller(Network.connections.Select(n => (IWindowContent)new Label(n.ipAddress)).ToArray()));
+                _kestrelWindow.Contents.Add(new Button("Toggle chat window", ToggleChatWindow));
+                _kestrelWindow.Contents.Add(new Button("Disconnect", Disconnect));
             }
             else
             {
@@ -54,6 +107,24 @@ namespace Khylib
                 _kestrelWindow.Contents.Add(new Button("Host session", HostSession));
             }
             _kestrelWindow.WindowRect = _kestrelWindow.WindowRect.Set(200, 200);
+        }
+
+        private static void Disconnect()
+        {
+            Network.Disconnect(1000);
+        }
+
+        private void ToggleChatWindow()
+        {
+            if (_chatWindow == null)
+                _chatWindow = new Window("Kestrel Chat") { WindowRect = new Rect(200, 200, 400, 300), Contents = new List<IWindowContent> { new Scroller(new IWindowContent[] { new Label("") }), new TextBox("", "", SendChatMessage) } };
+            else
+                _chatWindow.IsRendered = !_chatWindow.IsRendered;
+        }
+
+        private void SendChatMessage(string s)
+        {
+            networkView.RPC("OnChatMessage", RPCMode.All, "A name", s);
         }
 
         private void HostSession()
@@ -73,44 +144,47 @@ namespace Khylib
                 ErrorPopup.Error("Cannot connect: Already connected");
                 return;
             }
+            if (FlightGlobals.fetch != null && FlightGlobals.ActiveVessel != null)
+            {
+                ErrorPopup.Error("Cannot connect while in flight mode, please go to KSC.");
+                return; // best solution would be main menu option, but I'm not Squad
+            }
             Network.Connect(((TextBox)_kestrelWindow.Contents[0]).Value, Port);
         }
 
-        private void RunNetInit()
+        private void CreateVessel(Vessel vessel)
         {
-            _networker = new GameObject("KestrelNetworker", typeof(NetworkView), typeof(KestrelNetworker)).GetComponent<KestrelNetworker>();
-            _networker.networkView.RPC("CreateVesselWatch", RPCMode.All, Network.AllocateViewID());
+            var id = Network.AllocateViewID();
+            vessel.gameObject.AddNetworkView(id);
+            vessel.gameObject.AddComponent<VesselNetworker>();
+            var cfg = new ConfigNode();
+            vessel.protoVessel.Save(cfg);
+            networkView.RPC("AllocVessel", RPCMode.Others, id, IOUtils.SerializeToBinary(cfg));
         }
 
         public void OnPlayerConnected(NetworkPlayer player)
         {
-            foreach (var vesselWatch in FindObjectsOfType(typeof(VesselWatch)).Cast<VesselWatch>())
-                _networker.networkView.RPC("CreateVesselWatch", player, vesselWatch.networkView.viewID);
+            foreach (var nv in FlightGlobals.Vessels.Select(v => v.networkView).Where(n => n != null))
+                nv.SetScope(player, false);
+            networkView.RPC("VersionCheck", player, FlightState.lastCompatibleMajor, FlightState.lastCompatibleMinor, FlightState.lastCompatibleRev, NetworkVersion);
             print(player.guid + " with ip " + player.ipAddress + " connected");
             _updateGui = true;
         }
 
         public void OnServerInitialized()
         {
-            RunNetInit();
             print("Sucessfully hosted server");
             _updateGui = true;
         }
 
         public void OnConnectedToServer()
         {
-            RunNetInit();
             print("Connected to server");
             _updateGui = true;
         }
 
         public void OnPlayerDisconnected(NetworkPlayer player)
         {
-            foreach (var vesselWatch in FindObjectsOfType(typeof(VesselWatch)).Cast<VesselWatch>().Where(v => v.networkView.owner == player))
-            {
-                vesselWatch.KillVessel();
-                Destroy(vesselWatch);
-            }
             print(player.guid + " with ip " + player.ipAddress + " disconnected");
             _updateGui = true;
         }
@@ -119,6 +193,14 @@ namespace Khylib
         {
             print("Disconnected: " + reason);
             ErrorPopup.Error("Disconnected from server: " + reason);
+            var game = GamePersistence.LoadGame("kestrel", HighLogic.SaveFolder, false, false);
+            if (game == null)
+                print("ERROR: Kestrel.sfs persistence file not found! Not reverting to original state!");
+            else
+            {
+                HighLogic.CurrentGame = game;
+                HighLogic.CurrentGame.flightState.Load();
+            }
             _updateGui = true;
         }
 
@@ -128,96 +210,171 @@ namespace Khylib
             ErrorPopup.Error("Failed to connect to server: " + reason);
             _updateGui = true;
         }
-    }
-
-    [RequireComponent(typeof(NetworkView))]
-    public class KestrelNetworker : MonoBehaviour
-    {
-        public void Start()
-        {
-            networkView.observed = this;
-            networkView.stateSynchronization = NetworkStateSynchronization.Off;
-        }
 
         [RPC]
-        public void Alert(string message, NetworkMessageInfo sender)
+        public void VersionCheck(int kspMajor, int kspMinor, int kspRev, int kestrel)
         {
-            if (sender.sender == Network.player)
+            if (Network.isServer)
+            {
+                print("Warning: VersionCheck called on server");
                 return;
-            ErrorPopup.Error(message);
-            print(message);
+            }
+            if (FlightState.lastCompatibleMajor != kspMajor || FlightState.lastCompatibleMinor != kspMinor || FlightState.lastCompatibleRev != kspRev)
+            {
+                ErrorPopup.Error("Incompatible KSP versions, disconnected");
+                print("Incompatible KSP versions\nMine: " + FlightState.lastCompatibleMajor + "." + FlightState.lastCompatibleMinor + "." + FlightState.lastCompatibleRev + "\nTheirs: " + kspMajor + "." + kspMinor + "." + kspRev);
+                Network.Disconnect(200);
+            }
+            else if (NetworkVersion != kestrel)
+            {
+                ErrorPopup.Error("Incompatible Kestrel versions, disconnected");
+                print("Incompatible Kestrel versions\nMine: " + NetworkVersion + "\nTheirs: " + kestrel);
+                Network.Disconnect(200);
+            }
+            else
+            {
+                print("Saving : " + GamePersistence.SaveGame("kestrel", HighLogic.SaveFolder, SaveMode.OVERWRITE));
+                foreach (var vessel in FlightGlobals.Vessels.ToArray())
+                    vessel.Die();
+                networkView.RPC("Handshake", RPCMode.Server);
+            }
         }
 
         [RPC]
-        public void CreateVesselWatch(NetworkViewID id)
+        public void Handshake(NetworkMessageInfo info)
         {
-            if (NetworkView.Find(id) == null)
-                new GameObject("VesselWatch", typeof(NetworkView), typeof(VesselWatch)).GetComponent<NetworkView>().viewID = id;
+            if (Network.isServer)
+            {
+                foreach (var vessel in FlightGlobals.Vessels.Where(v => v.networkView != null))
+                {
+                    var cfg = new ConfigNode();
+                    vessel.protoVessel.Save(cfg);
+                    networkView.RPC("AllocVessel", info.sender, vessel.networkView.viewID, IOUtils.SerializeToBinary(cfg));
+                }
+                foreach (var nv in FlightGlobals.Vessels.Select(v => v.networkView).Where(n => n != null))
+                    nv.SetScope(info.sender, true);
+            }
+            else
+                print("Warning: Handshake called on client");
+        }
+
+        [RPC]
+        public void AllocVessel(NetworkViewID id, byte[] binaryCfg)
+        {
+            if (FlightGlobals.Vessels.Any(v => v.networkView != null && v.networkView.viewID == id))
+                return;
+            var cfg = (ConfigNode)IOUtils.DeserializeFromBinary(binaryCfg);
+            var protovessel = new ProtoVessel(cfg, HighLogic.CurrentGame.flightState);
+            protovessel.orbitSnapShot.meanAnomalyAtEpoch += 1;
+            protovessel.Load(HighLogic.CurrentGame.flightState);
+            var vessel = protovessel.vesselRef;
+            vessel.gameObject.AddNetworkView(id);
+            vessel.gameObject.AddComponent<VesselNetworker>();
+        }
+
+        [RPC]
+        public void SetGlobals(int largeUt, int smallUt, int timewarpIndex, NetworkMessageInfo info)
+        {
+            var packetTime = Network.time - info.timestamp;
+            var longUt = largeUt * uint.MaxValue + smallUt;
+            Planetarium.SetUniversalTime((double)longUt / UtCompressRatio + packetTime * TimeWarp.CurrentRate);
+            TimeWarp.SetRate(timewarpIndex, true);
+        }
+
+        [RPC]
+        public void OnChatMessage(string sender, string message)
+        {
+            ((Label)((Scroller)_chatWindow.Contents[0]).Contents[0]).Text += "<" + sender + "> " + message + "\n";
         }
     }
 
-    [RequireComponent(typeof(NetworkView))]
-    public class VesselWatch : MonoBehaviour
+    [RequireComponent(typeof(Vessel), typeof(NetworkView))]
+    public class VesselNetworker : MonoBehaviour
     {
         public void Start()
         {
             networkView.observed = this;
+            networkView.stateSynchronization = NetworkStateSynchronization.Unreliable;
         }
-
-        private Vessel _watching;
 
         public void OnSerializeNetworkView(BitStream stream, NetworkMessageInfo info)
         {
-            if (FlightGlobals.ActiveVessel == null)
-            {
-                var nullvec = Vector3.zero;
-                var negOne = -1;
-                stream.Serialize(ref nullvec);
-                stream.Serialize(ref nullvec);
-                stream.Serialize(ref negOne);
-                return;
-            }
+            var vessel = GetComponent<Vessel>();
             if (stream.isWriting)
             {
-                if (_watching == null || _watching.isActiveVessel == false)
-                    _watching = FlightGlobals.ActiveVessel;
-                var pos = (Vector3)_watching.orbit.pos;
-                var vel = (Vector3)_watching.orbit.vel;
-                var bodyId = FlightGlobals.Bodies.IndexOf(_watching.orbit.referenceBody);
-                stream.Serialize(ref pos);
-                stream.Serialize(ref vel);
+                var eccentricity = (float)vessel.orbit.eccentricity;
+                var semiMajorAxis = (float)vessel.orbit.semiMajorAxis;
+                var inclination = (float)vessel.orbit.inclination;
+                var lan = (float)vessel.orbit.LAN;
+                var argumentOfPeriapsis = (float)vessel.orbit.argumentOfPeriapsis;
+                var meanAnomalyAtEpoch = (float)vessel.orbit.meanAnomalyAtEpoch;
+                var epoch = (float)vessel.orbit.epoch;
+                var bodyId = FlightGlobals.Bodies.IndexOf(vessel.orbit.referenceBody);
+                stream.Serialize(ref eccentricity, float.Epsilon);
+                stream.Serialize(ref semiMajorAxis, float.Epsilon);
+                stream.Serialize(ref inclination, float.Epsilon);
+                stream.Serialize(ref lan, float.Epsilon);
+                stream.Serialize(ref argumentOfPeriapsis, float.Epsilon);
+                stream.Serialize(ref meanAnomalyAtEpoch, float.Epsilon);
+                stream.Serialize(ref epoch, float.Epsilon);
                 stream.Serialize(ref bodyId);
             }
             else
             {
-                Vector3 pos = new Vector3(), vel = new Vector3();
+                float eccentricity = 0f, semiMajorAxis = 0f, inclination = 0f, lan = 0f, argumentOfPeriapsis = 0f;
+                var meanAnomalyAtEpoch = 0f;
+                var epoch = 0f;
                 var bodyId = 0;
-                stream.Serialize(ref pos);
-                stream.Serialize(ref vel);
+                stream.Serialize(ref eccentricity, float.Epsilon);
+                stream.Serialize(ref semiMajorAxis, float.Epsilon);
+                stream.Serialize(ref inclination, float.Epsilon);
+                stream.Serialize(ref lan, float.Epsilon);
+                stream.Serialize(ref argumentOfPeriapsis, float.Epsilon);
+                stream.Serialize(ref meanAnomalyAtEpoch, float.Epsilon);
+                stream.Serialize(ref epoch, float.Epsilon);
                 stream.Serialize(ref bodyId);
-                if (bodyId == -1)
+                var newOrbit = new Orbit(inclination, eccentricity, semiMajorAxis, lan, argumentOfPeriapsis, meanAnomalyAtEpoch, epoch, FlightGlobals.Bodies[bodyId]);
+                newOrbit.UpdateFromUT(Planetarium.GetUniversalTime());
+                if (vessel.packed)
                 {
-                    KillVessel();
-                    return;
+                    if (vessel.Landed)
+                        vessel.Landed = false;
+                    if (vessel.Splashed)
+                        vessel.Splashed = false;
+                    vessel.orbit.UpdateFromOrbitAtUT(newOrbit, Planetarium.GetUniversalTime(), newOrbit.referenceBody);
                 }
-                if (_watching == null)
+                else
                 {
-                    var protovessel = new ProtoVessel(FlightGlobals.ActiveVessel);
-                    protovessel.orbitSnapShot.meanAnomalyAtEpoch += 1;
-                    var state = new FlightState { universalTime = Planetarium.GetUniversalTime() };
-                    protovessel.Load(state);
-                    _watching = protovessel.vesselRef;
-                    print("Created vessel");
+                    vessel.SetPosition(newOrbit.pos);
+                    vessel.SetWorldVelocity(newOrbit.vel);
                 }
-                _watching.orbit.UpdateFromStateVectors(pos, vel, FlightGlobals.Bodies[bodyId], Planetarium.GetUniversalTime());
             }
         }
 
-        public void KillVessel()
+        [RPC]
+        public void GiveOwnership()
         {
-            if (_watching != FlightGlobals.ActiveVessel)
-                _watching.Die();
-            _watching = null;
+            networkView.RPC("SetOwner", RPCMode.All, Network.AllocateViewID());
+        }
+
+        [RPC]
+        public void SetOwner(NetworkViewID id)
+        {
+            networkView.viewID = id;
+        }
+
+        public void OnDestroy()
+        {
+            if (Network.peerType != NetworkPeerType.Disconnected)
+                networkView.RPC("KillSelf", RPCMode.Others);
+        }
+
+        [RPC]
+        public void KillSelf()
+        {
+            var vessel = GetComponent<Vessel>();
+            if (vessel.state != Vessel.State.DEAD)
+                vessel.Die();
         }
     }
 }

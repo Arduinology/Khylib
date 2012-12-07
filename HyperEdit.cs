@@ -135,6 +135,12 @@ namespace Khylib
         {
             return new Rect(rect.xMin, rect.yMin, width, height);
         }
+
+        public static void AddNetworkView(this GameObject gameObject, NetworkViewID id)
+        {
+            var nv = gameObject.AddComponent<NetworkView>();
+            nv.viewID = id;
+        }
     }
 
     public static class UnitParser

@@ -37,13 +37,9 @@ namespace Khylib
 
     public static class ErrorPopup
     {
-        private static PopupWindow _lastError;
-
         public static void Error(string message)
         {
-            if (_lastError != null && _lastError.IsRendered)
-                _lastError.CloseWindow();
-            _lastError = new PopupWindow(message, "", 150, 50);
+            PopupDialog.SpawnPopupDialog("Error", message, "Close", true, HighLogic.Skin);
         }
     }
 

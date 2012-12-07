@@ -8,9 +8,9 @@ Kestrel is a multiplayer mod. 'Nuff said.
 
 Release state:
 
-Pre-alpha - current
+Pre-alpha
 
-Alpha (annouce to public)
+Alpha - current
 
 Beta (public testing)
 
@@ -23,18 +23,14 @@ TODO:
 
 Big:
 
-Enable syncronization of all ships, not just the active one for each person.
-
 More information transfer when inside 2.5km range, rotation, speed, perhaps input, etc.
 
 Multiple people controlling same vessel.
 
+OH GOD ALL THE BUGS. ALL OF THEM.
+
 
 Medium:
-
-Sync entire ship state, parts, resources etc. Small goal: just sync parts.
-
-Sync universe as in universal time, time warp rate, etc.
 
 Timewarp issue. Look for multitudes of forum posts on multiplayer for ideas.
 
